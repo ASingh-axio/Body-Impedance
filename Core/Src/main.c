@@ -33,13 +33,24 @@ typedef struct{
 	uint16_t counterPeriod;
 	uint16_t counterPulse;
 	uint16_t counterPrescaler;
-}pulseParam;
+}sPulseParam;
+
+typedef struct{
+	uint8_t adcTimerPrescaler, adcTimerPeriod;
+}sADCTimerParam;
+
+typedef struct{
+	uint8_t firstLoopFlag;
+	volatile float impedanceTotal, impedanceAvg, impedanceEMAPres, impedanceEMAPrev, deltaImpedance;
+}sImpedanceCalParam;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define PWM_DEAD_TIME 15 /* gives ~210ns dead time for apb2 timer clock freq of 72MHZ
 						    to calc dead time value -> (PWM_DEAD_TIME = dead_time(ns) * apb2_tim_freq(MHz) */
+#define ADC_BUF_LEN 10
+#define DELTA_IMP_THRESHOLD 100
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -50,19 +61,27 @@ typedef struct{
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
+DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 
 /* USER CODE BEGIN PV */
-volatile pulseParam pwm_pulseParameters = {.counterPrescaler = 0, .counterPeriod = 360, .counterPulse = 300};
-volatile adc_timer_prescale = 72;
-volatile adc_timer_period = 100;
+
+volatile sPulseParam pwmPulseParameters = {.counterPrescaler = 0, .counterPeriod = 360, .counterPulse = 300};
+volatile sADCTimerParam adcTimerParameters = {71, 2}; //prescaler = 72, period = 1 , so adc timer freq = 1MHz //prescaler = 72, period = 1 , so adc timer freq = 1MHz
+sImpedanceCalParam impedanceCalParameters = {.firstLoopFlag = 1, .impedanceTotal = 0, .impedanceAvg = 0, .impedanceEMAPres = 0, .impedanceEMAPrev = 0, .deltaImpedance = 0};
+volatile uint8_t DMATransferComplete = 0;   //DMA flag
+volatile uint32_t adcBuf[ADC_BUF_LEN] = {0};
+volatile float emaAlpha = 0.1;
+float current, voltage;
+uint32_t adcCurrent, adcVoltage;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_TIM1_Init(void);
@@ -105,11 +124,16 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_TIM1_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  HAL_ADCEx_Calibration_Start(&hadc1);
+  HAL_ADCEx_Calibration_Start(&hadc2);
+  HAL_ADC_Start(&hadc2);
+  HAL_ADCEx_MultiModeStart_DMA(&hadc1, adcBuf, ADC_BUF_LEN);
 
   /* USER CODE END 2 */
 
@@ -118,9 +142,15 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);	   // turn on pwm channel for h-bridge switching
   HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1); // turn on complementary channel
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
 
   while (1)
   {
+	  if(DMATransferComplete){
+		  Calc_Impedance();
+		  DMATransferComplete = 0;
+	  }
+
 
     /* USER CODE END WHILE */
 
@@ -300,9 +330,9 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = pwm_pulseParameters.counterPrescaler;
+  htim1.Init.Prescaler = pwmPulseParameters.counterPrescaler;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = pwm_pulseParameters.counterPeriod;
+  htim1.Init.Period = pwmPulseParameters.counterPeriod;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -317,7 +347,7 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = pwm_pulseParameters.counterPulse;
+  sConfigOC.Pulse = pwmPulseParameters.counterPulse;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -366,9 +396,9 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = adc_timer_prescaler;
+  htim3.Init.Prescaler = adcTimerParameters.adcTimerPrescaler;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = adc_timer_period;
+  htim3.Init.Period = adcTimerParameters.adcTimerPeriod;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -393,24 +423,113 @@ static void MX_TIM3_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 /* USER CODE BEGIN MX_GPIO_Init_1 */
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_2, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
 /* USER CODE BEGIN MX_GPIO_Init_2 */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET); //PIN13 LED is active low
 /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc){
+}
+
+//called when adc buffer is completely filled
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
+	DMATransferComplete = 1;
+	HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_2);
+}
+
+void Calc_Impedance(void){
+	 //float current, voltage;
+	 impedanceCalParameters.impedanceTotal = 0;
+	 for(int i = 0; i < ADC_BUF_LEN ; i++){
+				 /*uint32_t*/ adcCurrent = (adcBuf[i] >> 16) & 0x0FFF;  // PA1-ADC2  Current
+				 /*uint32_t*/ adcVoltage = adcBuf[i] & 0x0FFF;            // PA0-ADC1  Voltage
+				 current = ((adcCurrent + 1) * 3.3)/4095; // "+1" to prevent division by 0
+				 voltage = (adcVoltage * 3.3)/4095;
+				 impedanceCalParameters.impedanceTotal += voltage/current;
+			 }
+	 impedanceCalParameters.impedanceAvg = impedanceCalParameters.impedanceTotal/ADC_BUF_LEN;
+	 impedanceCalParameters.impedanceEMAPres = emaAlpha * impedanceCalParameters.impedanceAvg + (1 - emaAlpha) * impedanceCalParameters.impedanceEMAPrev;
+
+	  if(impedanceCalParameters.firstLoopFlag){
+		  impedanceCalParameters.impedanceEMAPrev = impedanceCalParameters.impedanceEMAPres;
+		  impedanceCalParameters.firstLoopFlag = 0;
+	  }
+	  else{
+		  impedanceCalParameters.deltaImpedance = fabs(impedanceCalParameters.impedanceEMAPres - impedanceCalParameters.impedanceEMAPrev);
+		  if(impedanceCalParameters.deltaImpedance > DELTA_IMP_THRESHOLD){
+			  Enter_Idle_State();
+		  }
+		  impedanceCalParameters.impedanceEMAPrev = impedanceCalParameters.impedanceEMAPres;
+	  }
+}
+
+void Enter_Idle_State(void) {
+    // Disable global interrupts
+    __disable_irq();
+    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
+    // Stop any ongoing peripherals (e.g., timers, ADCs, etc.)
+    //Stop_Peripherals();
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    // Enter a low-power mode (e.g., sleep mode)
+    //HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);
+    while(1);
+
+    // The microcontroller will remain in this state until a reset or external interrupt occurs
+}
+
 
 /* USER CODE END 4 */
 
